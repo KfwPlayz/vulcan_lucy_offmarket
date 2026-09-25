@@ -10,15 +10,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 🔐 Credentials and Constants
 const LOGIN_URL = "https://www.vulcan7dialer.com/login";
 const CONTACTS_URL = "https://www.vulcan7dialer.com/cm/index#params/dmlld19pZD0xNDUzNjc3JnBhZ2U9MQ==";
+const FOLDER_URL = "https://www.vulcan7dialer.com/cm/folders/index";
 const EMAIL = process.env.EMAIL;
 const PASSWORD = process.env.PASSWORD;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
-//const CACHE_FILE = path.join(__dirname, "sent-leads-cache-offmarket.json");
+// const CACHE_FILE = path.join(__dirname, "sent-leads-cache-offmarket.json");
+
+// 📅 Folder name = Monday of current week
+const today = new Date();
+const day = today.getDay();
+const offset = (day === 0) ? -6 : 1 - day;
+const monday = new Date(today);
+monday.setDate(today.getDate() + offset);
+const folderName = `Moved to GHL`;
 
 (async () => {
   const browser = await puppeteer.launch({
     headless: "new",
-    protocolTimeout: 180000,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium-browser",
     args: [
       "--no-sandbox",
@@ -41,15 +49,15 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
   await page.setViewport({ width: 1366, height: 768 });
 
   await page.setRequestInterception(true);
-  page.on("request", req => {
+  page.on("request", (req) => {
     const type = req.resourceType();
     if (type === "image" || type === "font" || type === "media") req.abort();
     else req.continue();
   });
 
-  page.on("console", msg => console.log("[BROWSER]", msg.type(), msg.text()));
-  page.on("pageerror", err => console.log("[PAGEERROR]", err));
-  page.on("requestfailed", req => console.log("[REQ FAILED]", req.url(), req.failure()?.errorText));
+  page.on("console", (msg) => console.log("[BROWSER]", msg.type(), msg.text()));
+  page.on("pageerror", (err) => console.log("[PAGEERROR]", err));
+  page.on("requestfailed", (req) => console.log("[REQ FAILED]", req.url(), req.failure()?.errorText));
   // === end CI hardening ===
 
   try {
@@ -58,10 +66,15 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
     await page.waitForSelector('input[name="email"], #email, input[name="username"]', { timeout: 120000 });
     await page.waitForSelector('input[name="password"], #password', { timeout: 120000 });
 
-    const emailSel = (await page.$('input[name="email"]')) ? 'input[name="email"]'
-                     : (await page.$('#email')) ? '#email'
-                     : 'input[name="username"]';
-    const passSel  = (await page.$('input[name="password"]')) ? 'input[name="password"]' : '#password';
+    const emailSel = (await page.$('input[name="email"]'))
+      ? 'input[name="email"]'
+      : (await page.$('#email'))
+        ? '#email'
+        : 'input[name="username"]';
+
+    const passSel = (await page.$('input[name="password"]'))
+      ? 'input[name="password"]'
+      : '#password';
 
     await page.type(emailSel, EMAIL, { delay: 20 });
     await page.type(passSel, PASSWORD, { delay: 20 });
@@ -109,7 +122,10 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
     console.log(`✅ Found ${leads.length} raw leads in "Off Market"`);
 
     // 📥 Deduplication
-    const seen = new Set(), filtered = [], dupes = [];
+    const seen = new Set();
+    const filtered = [];
+    const dupes = [];
+
     for (const lead of leads) {
       const key = `${lead.full_name}|${lead.phone}`;
       if (lead.full_name.toLowerCase() === "possible owner" || !seen.has(key)) {
@@ -120,17 +136,37 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
       }
     }
 
+    // // 🧠 Load cache
+    // let sentCache = new Set();
+    // if (fs.existsSync(CACHE_FILE)) {
+    //   try {
+    //     sentCache = new Set(JSON.parse(fs.readFileSync(CACHE_FILE, "utf-8")));
+    //   } catch {
+    //     // ignore bad cache
+    //   }
+    // }
+
+    // const unsentLeads = [], newKeys = [];
+    // for (const lead of filtered) {
+    //   const key = `${lead.full_name}|${lead.phone}`;
+    //   if (!sentCache.has(key)) {
+    //     unsentLeads.push(lead);
+    //     newKeys.push(key);
+    //   }
+    // }
+
     const unsentLeads = filtered;
 
     for (const lead of unsentLeads) {
       const detailPage = await browser.newPage();
+
       try {
         const detailUrl = `https://www.vulcan7dialer.com/cm/index#contact/${lead.contact_id}`;
         await detailPage.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
 
         await detailPage.waitForFunction(() => {
           const ths = Array.from(document.querySelectorAll("th"));
-          return ths.some(th => th.textContent.includes("MLS Number"));
+          return ths.some((th) => th.textContent.includes("MLS Number"));
         }, { timeout: 15000 });
 
         const detailData = await detailPage.evaluate(() => {
@@ -150,11 +186,42 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
           const getBedsAndBaths = () => {
             const val = getTextAfterTh("Beds");
-            const [bedsRaw, bathsRaw] = val.split("/").map(v => clean(v));
+            const [bedsRaw, bathsRaw] = val.split("/").map((v) => clean(v));
             return {
               beds: bedsRaw || "",
               baths: bathsRaw || ""
             };
+          };
+
+          const getPhones = () => {
+            const phoneLinks = Array.from(
+              document.querySelectorAll('tbody[data-section="phones"] a[data-type="phone"]')
+            ).slice(0, 5);
+
+            const phones = [];
+
+            for (let i = 0; i < 5; i++) {
+              const el = phoneLinks[i];
+
+              if (!el) {
+                phones.push("");
+                continue;
+              }
+
+              let parsed = {};
+              try {
+                parsed = JSON.parse(el.getAttribute("data-value") || "{}");
+              } catch {}
+
+              const rawText = (el.textContent || "").trim();
+              const cleanNumber = rawText
+                .replace(/\((Home|Work|Mobile|Fax|Other)\)/gi, "")
+                .trim();
+
+              phones.push(parsed.phone || parsed.raw_phone || cleanNumber);
+            }
+
+            return phones;
           };
 
           // Address object
@@ -173,17 +240,18 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
           }
 
           // Link grabber
-          const links = Array.from(document.querySelectorAll("a[href]")).map(a => a.getAttribute("href"));
+          const links = Array.from(document.querySelectorAll("a[href]")).map((a) => a.getAttribute("href"));
 
           const matchLink = (pattern) => {
             const regex = new RegExp(pattern, "i");
-            return links.find(href => regex.test(href)) || "";
+            return links.find((href) => regex.test(href)) || "";
           };
 
-          const zillowRelative = links.find(h => h.includes("/zillow/go_to_site")) || "";
+          const zillowRelative = links.find((h) => h.includes("/zillow/go_to_site")) || "";
           const zillowLink = zillowRelative ? `https://www.vulcan7dialer.com${zillowRelative}` : "";
 
           const { beds, baths } = getBedsAndBaths();
+          const phones = getPhones();
 
           return {
             street: address.street,
@@ -208,7 +276,13 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
             linkedin: matchLink("linkedin\\.com"),
             twitter: matchLink("twitter\\.com"),
             tiktok: matchLink("tiktok\\.com"),
-            youtube: matchLink("youtube\\.com")
+            youtube: matchLink("youtube\\.com"),
+
+            phone_1: phones[0],
+            phone_2: phones[1],
+            phone_3: phones[2],
+            phone_4: phones[3],
+            phone_5: phones[4]
           };
         });
 
@@ -220,10 +294,15 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
             beds: "", baths: "", square_footage: "", days_on_market: "",
             listing_agent: "", listing_office: "",
             zillow_link: "", google_maps_link: "",
-            facebook: "", instagram: "", linkedin: "", twitter: "", tiktok: "", youtube: ""
+            facebook: "", instagram: "", linkedin: "", twitter: "", tiktok: "", youtube: "",
+
+            phone_1: "", phone_2: "", phone_3: "", phone_4: "", phone_5: ""
           },
           detailData
         );
+
+        // Make "phone" match phone_1 from the detail page
+        lead.phone = detailData.phone_1 || "";
 
       } catch (err) {
         console.error(`⚠️ Detail fetch failed for ${lead.full_name}: ${err.message}`);
@@ -246,9 +325,153 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
       }
     }
 
+    // 📁 Check/create folder
+    await page.goto(CONTACTS_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
+    await page.waitForSelector("div.contacts-folder-nav-name", { timeout: 120000 });
+
+    const normalizedName = folderName.replace(/\s+/g, "-");
+    const folderExists = await page.evaluate((dataFolderName) => {
+      const folders = [...document.querySelectorAll("div.contacts-folder-nav-name")];
+      return folders.some((f) => f.getAttribute("data-folder-name") === dataFolderName);
+    }, normalizedName);
+
+    if (!folderExists) {
+      console.log(`📁 Creating folder "${folderName}"`);
+      await page.goto(FOLDER_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
+      try {
+        await page.waitForSelector("#new_folder_button", { timeout: 120000 });
+        await page.click("#new_folder_button");
+        await page.waitForSelector("#name", { timeout: 120000 });
+        await page.type("#name", folderName);
+        try { await page.select("#placement", "INSIDE"); } catch {}
+        try {
+          await page.click("div[aria-haspopup='listbox']");
+          await page.waitForSelector("div[role='option']", { timeout: 10000 });
+          await page.evaluate(() => {
+            const option = [...document.querySelectorAll("div[role='option']")]
+              .find((el) => el.textContent.trim() === "Off Market");
+            option?.click();
+          });
+        } catch {}
+        try { await page.select("#layout", "8109"); } catch {}
+        try { await page.click("button[type='submit']"); } catch {}
+        await sleep(3000);
+      } catch (err) {
+        console.warn(`⚠️ Folder creation flow might have changed: ${err.message}`);
+      }
+    } else {
+      console.log(`✅ Folder "${folderName}" already exists — skipping creation.`);
+    }
+
+    // 📂 Move contacts
+    await page.goto(CONTACTS_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
+    await page.waitForSelector("#master_checkbox", { visible: true, timeout: 120000 });
+    await sleep(1500);
+
+    // Select all contacts
+    const alreadyChecked = await page.$eval("#master_checkbox", el => !!el.checked).catch(() => false);
+    if (!alreadyChecked) {
+      await page.click("#master_checkbox");
+      await sleep(1000);
+    }
+
+    const isChecked = await page.$eval("#master_checkbox", el => !!el.checked).catch(() => false);
+    if (!isChecked) {
+      throw new Error("Master checkbox was not checked.");
+    }
+
+    console.log("✅ Selected all contacts via master checkbox.");
+
+    // Open move menu
+    await page.waitForSelector("#cm_move_button", { visible: true, timeout: 120000 });
+    await page.click("#cm_move_button");
+    await sleep(1500);
+
+    // Wait for dropdown items
+    await page.waitForFunction(() => {
+      return document.querySelectorAll("li.move-contacts-folder[title]").length > 0 ||
+             document.querySelectorAll("#cm_move_dropdown li, .dropdown-menu li").length > 0;
+    }, { timeout: 10000 });
+
+    // Click exact folder entry
+    const clickedFolder = await page.evaluate((targetFolderName) => {
+      const normalize = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+      let items = Array.from(document.querySelectorAll("li.move-contacts-folder[title]"));
+      if (!items.length) {
+        items = Array.from(document.querySelectorAll("#cm_move_dropdown li, .dropdown-menu li"));
+      }
+
+      for (const item of items) {
+        const title = normalize(item.getAttribute("title") || item.textContent || "");
+        if (title === normalize(targetFolderName)) {
+          const link =
+            item.querySelector("a.move-to-folder") ||
+            item.querySelector("a") ||
+            item;
+
+          link.scrollIntoView({ block: "center" });
+          link.click();
+          return true;
+        }
+      }
+
+      return false;
+    }, folderName);
+
+    if (!clickedFolder) {
+      throw new Error(`Could not find move folder: ${folderName}`);
+    }
+
+    console.log(`✅ Clicked folder "${folderName}" in move menu.`);
+    await sleep(1500);
+
+    // Confirm modal if it appears
+    try {
+      await page.waitForSelector("#bulk_actions_modal", { visible: true, timeout: 5000 });
+
+      const confirmed = await page.evaluate(() => {
+        const modal = document.querySelector("#bulk_actions_modal");
+        if (!modal) return false;
+
+        const buttons = Array.from(modal.querySelectorAll("button"));
+        const btn = buttons.find(b =>
+          /okay|ok|move|confirm/i.test((b.textContent || "").trim())
+        );
+
+        if (btn) {
+          btn.click();
+          return true;
+        }
+
+        const primary = modal.querySelector("button.btn.btn-primary");
+        if (primary) {
+          primary.click();
+          return true;
+        }
+
+        return false;
+      });
+
+      if (confirmed) {
+        console.log("🟢 Confirmed move modal.");
+        await sleep(3000);
+      } else {
+        console.warn("⚠️ Move modal appeared, but confirm button was not found.");
+      }
+    } catch {
+      console.log("ℹ️ No confirmation modal appeared.");
+    }
+
+    // Give Vulcan7 time to process
+    await sleep(4000);
+    console.log(`✅ Move attempt finished for folder "${folderName}"`);
+
   } catch (err) {
     console.error("❌ Script Error:", err);
-    try { await page.screenshot({ path: "failure.png", fullPage: true }); } catch {}
+    try {
+      await page.screenshot({ path: "failure.png", fullPage: true });
+    } catch {}
     process.exitCode = 1;
   } finally {
     await browser.close();
