@@ -9,7 +9,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 🔐 Credentials and Constants
 const LOGIN_URL = "https://www.vulcan7dialer.com/login";
-const CONTACTS_URL = "https://www.vulcan7dialer.com/cm/index#params/dmlld19pZD05ODEzOCZwYWdlPTE=";
+const CONTACTS_URL = "https://www.vulcan7dialer.com/cm/index#params/dmlld19pZD0xNDUzNjc3JnBhZ2U9MQ==";
 const EMAIL = process.env.EMAIL;
 const PASSWORD = process.env.PASSWORD;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
