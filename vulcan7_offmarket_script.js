@@ -14,6 +14,8 @@ const FOLDER_URL = "https://www.vulcan7dialer.com/cm/folders/index";
 const EMAIL = process.env.EMAIL;
 const PASSWORD = process.env.PASSWORD;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
+// Set DEBUG_FIELDS=1 to print the detail-page labels and phone markup for the first lead
+const DEBUG_FIELDS = process.env.DEBUG_FIELDS === "1";
 // const CACHE_FILE = path.join(__dirname, "sent-leads-cache-offmarket.json");
 
 // 📅 Folder name = Monday of current week
@@ -156,6 +158,7 @@ const folderName = `Moved to GHL`;
     // }
 
     const unsentLeads = filtered;
+    let debugPrinted = false;
 
     for (const lead of unsentLeads) {
       const detailPage = await browser.newPage();
@@ -168,6 +171,19 @@ const folderName = `Moved to GHL`;
           const ths = Array.from(document.querySelectorAll("th"));
           return ths.some((th) => th.textContent.includes("MLS Number"));
         }, { timeout: 15000 });
+
+        // 🐞 Optional: dump labels + phone markup once so selectors can be confirmed
+        if (DEBUG_FIELDS && !debugPrinted) {
+          debugPrinted = true;
+          const dump = await detailPage.evaluate(() => ({
+            labels: Array.from(document.querySelectorAll("tr th")).map((th) =>
+              (th.textContent || "").replace(/\s+/g, " ").trim()
+            ),
+            phonesHtml: document.querySelector('tbody[data-section="phones"]')?.outerHTML || "(no phones section)"
+          }));
+          console.log("🐞 Detail labels:", JSON.stringify(dump.labels));
+          console.log("🐞 Phones HTML:", dump.phonesHtml);
+        }
 
         const detailData = await detailPage.evaluate(() => {
           const clean = (t) => (t || "").replace(/\s+/g, " ").trim();
@@ -193,18 +209,61 @@ const folderName = `Moved to GHL`;
             };
           };
 
+          // 👥 Owner 2 = the second name listed under "Name" (the one that isn't #primary_name)
+          const getOwner2 = () => {
+            const el = document.querySelector(
+              'tbody[data-section="names"] a[data-type="fullname"]:not(#primary_name)'
+            );
+            if (!el) return { first: "", last: "" };
+
+            let parsed = {};
+            try {
+              parsed = JSON.parse(el.getAttribute("data-value") || "{}");
+            } catch {}
+
+            let first = clean(parsed.first_name);
+            let last = clean(parsed.last_name);
+
+            // Fallback: split the visible text like the main name
+            if (!first && !last) {
+              const parts = clean(el.textContent).split(" ");
+              first = parts[0] || "";
+              last = parts.slice(1).join(" ");
+            }
+
+            return { first, last };
+          };
+
+          // 🚫 DNC check for one phone link: "DNC" if flagged, "" if not
+          const getDncStatus = (el, parsed) => {
+            // National DNC: Vulcan7 adds the "national_dnc" class to the number link
+            if (el.classList.contains("national_dnc")) return "DNC";
+
+            // National DNC: "DNC" label next to the number in the same cell
+            const cell = el.closest("td");
+            const labels = cell ? Array.from(cell.querySelectorAll("span.label")) : [];
+            if (labels.some((s) => clean(s.textContent).toUpperCase() === "DNC")) return "DNC";
+
+            // Internal DNC / blacklist flag in the number's data
+            if (parsed.do_not_call === true || parsed.do_not_call === "1" || parsed.do_not_call === 1) return "DNC";
+
+            return "";
+          };
+
           const getPhones = () => {
             const phoneLinks = Array.from(
               document.querySelectorAll('tbody[data-section="phones"] a[data-type="phone"]')
             ).slice(0, 5);
 
             const phones = [];
+            const dnc = [];
 
             for (let i = 0; i < 5; i++) {
               const el = phoneLinks[i];
 
               if (!el) {
                 phones.push("");
+                dnc.push("");
                 continue;
               }
 
@@ -219,9 +278,10 @@ const folderName = `Moved to GHL`;
                 .trim();
 
               phones.push(parsed.phone || parsed.raw_phone || cleanNumber);
+              dnc.push(getDncStatus(el, parsed));
             }
 
-            return phones;
+            return { phones, dnc };
           };
 
           // Address object
@@ -251,7 +311,8 @@ const folderName = `Moved to GHL`;
           const zillowLink = zillowRelative ? `https://www.vulcan7dialer.com${zillowRelative}` : "";
 
           const { beds, baths } = getBedsAndBaths();
-          const phones = getPhones();
+          const { phones, dnc } = getPhones();
+          const owner2 = getOwner2();
 
           return {
             street: address.street,
@@ -278,11 +339,19 @@ const folderName = `Moved to GHL`;
             tiktok: matchLink("tiktok\\.com"),
             youtube: matchLink("youtube\\.com"),
 
+            owner_2_first_name: owner2.first,
+            owner_2_last_name: owner2.last,
+
             phone_1: phones[0],
+            phone_1_dnc: dnc[0],
             phone_2: phones[1],
+            phone_2_dnc: dnc[1],
             phone_3: phones[2],
+            phone_3_dnc: dnc[2],
             phone_4: phones[3],
-            phone_5: phones[4]
+            phone_4_dnc: dnc[3],
+            phone_5: phones[4],
+            phone_5_dnc: dnc[4]
           };
         });
 
@@ -296,7 +365,13 @@ const folderName = `Moved to GHL`;
             zillow_link: "", google_maps_link: "",
             facebook: "", instagram: "", linkedin: "", twitter: "", tiktok: "", youtube: "",
 
-            phone_1: "", phone_2: "", phone_3: "", phone_4: "", phone_5: ""
+            owner_2_first_name: "", owner_2_last_name: "",
+
+            phone_1: "", phone_1_dnc: "",
+            phone_2: "", phone_2_dnc: "",
+            phone_3: "", phone_3_dnc: "",
+            phone_4: "", phone_4_dnc: "",
+            phone_5: "", phone_5_dnc: ""
           },
           detailData
         );
@@ -360,7 +435,7 @@ const folderName = `Moved to GHL`;
         console.warn(`⚠️ Folder creation flow might have changed: ${err.message}`);
       }
     } else {
-      console.log(`✅ Folder "${folderName}" already exists — skipping creation.`);
+      console.log(`✅ Folder "${folderName}" already exists, skipping creation.`);
     }
 
     // 📂 Move contacts
