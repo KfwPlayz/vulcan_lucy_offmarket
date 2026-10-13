@@ -2,7 +2,7 @@ name: Daily Vulcan7 Off Market Job
 
 on:
   schedule:
-    - cron: "0 8 * * 1-6"
+    - cron: "10 8 * * 1-6"
       timezone: "America/New_York"
   workflow_dispatch:
 
