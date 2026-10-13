@@ -2,7 +2,7 @@ name: Daily Vulcan7 Off Market Job
 
 on:
   schedule:
-    - cron: "10 8 * * 1-6"
+    - cron: "7 8 * * 1-6"
       timezone: "America/New_York"
   workflow_dispatch:
 
@@ -42,15 +42,8 @@ jobs:
           path: sent-leads-cache-offmarket.json
           key: offmarket-cache-${{ steps.date.outputs.DATE_ET }}
 
-      - name: Install Chromium
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y chromium-browser || sudo apt-get install -y chromium
-          if command -v chromium-browser >/dev/null 2>&1; then
-            echo "PUPPETEER_EXECUTABLE_PATH=$(command -v chromium-browser)" >> $GITHUB_ENV
-          elif command -v chromium >/dev/null 2>&1; then
-            echo "PUPPETEER_EXECUTABLE_PATH=$(command -v chromium)" >> $GITHUB_ENV
-          fi
+      - name: Use preinstalled Chrome
+        run: echo "PUPPETEER_EXECUTABLE_PATH=$(which google-chrome)" >> $GITHUB_ENV
 
       - name: Run script
         run: node vulcan7_offmarket_script.js
