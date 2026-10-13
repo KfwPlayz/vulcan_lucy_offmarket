@@ -35,6 +35,7 @@ const folderName = `Moved to GHL`;
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
+      "--disable-crash-reporter",
       "--single-process"
     ]
   });
