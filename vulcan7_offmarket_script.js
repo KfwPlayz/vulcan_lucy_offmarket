@@ -8,6 +8,20 @@ const axios = require("axios");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// page.goto that survives "net::ERR_ABORTED" (another navigation or redirect cut ours off)
+async function gotoWithRetry(pg, url, attempts = 3) {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await pg.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
+      return;
+    } catch (err) {
+      if (i === attempts) throw err;
+      console.warn(`Navigation failed (${i}/${attempts}): ${err.message}. Retrying...`);
+      await sleep(3000 * i);
+    }
+  }
+}
+
 // ---------- Config ----------
 const LOGIN_URL = "https://www.vulcan7dialer.com/login";
 
@@ -21,6 +35,7 @@ const MOVE_CONTACTS = (process.env.MOVE_CONTACTS || "true").toLowerCase() === "t
 const PHONE_CELL_ID = process.env.PHONE_CELL_ID || "143332"; // account specific column ids
 const EMAIL_CELL_ID = process.env.EMAIL_CELL_ID || "143333";
 const LIST_LABEL = process.env.LIST_LABEL || "Off Market"; // only used in log lines
+const MIN_LIST_PRICE = Number(process.env.MIN_LIST_PRICE || 150000); // leads listed below this are not sent
 const DEBUG_FIELDS = process.env.DEBUG_FIELDS === "1"; // dump labels + phone markup for the first lead
 
 if (!EMAIL || !PASSWORD || !WEBHOOK_URL) {
@@ -30,6 +45,12 @@ if (!EMAIL || !PASSWORD || !WEBHOOK_URL) {
 
 // Destination folder. It must already exist in Vulcan7, the script only moves into it.
 const folderName = process.env.FOLDER_NAME || "Moved to GHL";
+
+// "$249,900" -> 249900. Returns null when the text has no readable number.
+function parsePrice(text) {
+  const n = parseFloat(String(text || "").replace(/[^0-9.]/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
 
 // Every field the webhook expects, so a lead whose detail page fails still has all keys
 const DEFAULT_DETAIL = {
@@ -88,7 +109,7 @@ const DEFAULT_DETAIL = {
 
   try {
     // ---------- Log in ----------
-    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
+    await gotoWithRetry(page, LOGIN_URL);
     await page.waitForSelector('input[name="email"], #email, input[name="username"]', { timeout: 120000 });
     await page.waitForSelector('input[name="password"], #password', { timeout: 120000 });
 
@@ -110,8 +131,11 @@ const DEFAULT_DETAIL = {
       page.click('button[type="submit"], .login-button')
     ]);
 
+    // Let the post-login dashboard finish its own redirects before navigating again
+    await sleep(3000);
+
     // ---------- Scrape the contact list ----------
-    await page.goto(CONTACTS_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
+    await gotoWithRetry(page, CONTACTS_URL);
     await page.waitForSelector("tr[data-itemid]", { timeout: 120000 });
     await sleep(1500);
 
@@ -169,7 +193,7 @@ const DEFAULT_DETAIL = {
 
       try {
         const detailUrl = `https://www.vulcan7dialer.com/cm/index#contact/${lead.contact_id}`;
-        await detailPage.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
+        await gotoWithRetry(detailPage, detailUrl);
 
         await detailPage.waitForFunction(() => {
           const ths = Array.from(document.querySelectorAll("th"));
@@ -377,7 +401,29 @@ const DEFAULT_DETAIL = {
     // nothing gets moved out of the list unless it was delivered.
     const failedLeads = [];
 
+    // Price filter. List price only exists on the detail page, so this runs after the
+    // detail fetch. A lead with no readable price is still sent, so a failed detail
+    // page never silently drops a lead.
+    const toSend = [];
+    const belowMin = [];
+
     for (const lead of unsentLeads) {
+      const price = parsePrice(lead.list_price);
+
+      if (price !== null && price < MIN_LIST_PRICE) {
+        belowMin.push(lead);
+      } else {
+        if (price === null) console.log(`ℹ️ No readable list price for ${lead.full_name}, sending anyway.`);
+        toSend.push(lead);
+      }
+    }
+
+    console.log(`ℹ️ ${toSend.length} lead(s) at or above $${MIN_LIST_PRICE.toLocaleString("en-US")}, ${belowMin.length} below and not sent.`);
+    for (const lead of belowMin) {
+      console.log(`⏭️ Skipped (list price ${lead.list_price}): ${lead.full_name}`);
+    }
+
+    for (const lead of toSend) {
       let ok = false;
 
       for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
@@ -414,7 +460,7 @@ const DEFAULT_DETAIL = {
     }
 
     // ---------- Move contacts ----------
-    await page.goto(CONTACTS_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
+    await gotoWithRetry(page, CONTACTS_URL);
     await page.waitForSelector("tr[data-itemid]", { timeout: 120000 });
     await page.waitForSelector("#master_checkbox", { timeout: 120000 }); // no visible:true, it can read as hidden with images/fonts blocked
     await sleep(5000); // let all rows render and the select-all handler bind
