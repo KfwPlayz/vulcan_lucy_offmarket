@@ -31,7 +31,7 @@ jobs:
 
       # ---- Vulcan7 ----
       # CONTACTS_URL is NOT set here: the script's built-in default is the Off Market view
-      MOVE_CONTACTS: "false"                # TEST RUN FIRST. Change to "true" after checking the contacts in GHL
+      MOVE_CONTACTS: "true"                # TEST RUN FIRST. Change to "true" after checking the contacts in GHL
       FOLDER_NAME: "Expired Moved to GHL"
       LIST_LABEL: "Off Market"                 # only used in log lines
       MIN_LIST_PRICE: "150000"
