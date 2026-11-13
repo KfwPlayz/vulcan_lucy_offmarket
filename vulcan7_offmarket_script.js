@@ -1,7 +1,8 @@
-// Vulcan7 lead sync
-// Scrapes contacts from a Vulcan7 view, sends each one to a webhook, and optionally
-// moves them into an EXISTING folder (it never creates folders). Settings that differ
-// between accounts or lists come from environment variables set in the workflow file.
+// Vulcan7 lead sync (Off Market) - direct to GoHighLevel
+// Scrapes contacts from the Off Market view and creates/updates each one in GoHighLevel through the
+// API (no Zapier), then optionally moves them into an EXISTING Vulcan7 folder (it never
+// creates folders). Settings that differ between accounts or lists come from environment
+// variables set in the workflow file.
 
 const puppeteer = require("puppeteer");
 const axios = require("axios");
@@ -27,7 +28,11 @@ const LOGIN_URL = "https://www.vulcan7dialer.com/login";
 
 const EMAIL = process.env.EMAIL;
 const PASSWORD = process.env.PASSWORD;
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const GHL_TOKEN = process.env.GHL_TOKEN;                 // Private Integration token (GitHub secret)
+const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;     // sub-account (location) id
+const GHL_SOURCE = process.env.GHL_SOURCE || "vulcan";
+// Comma separated. Added to the contact, existing tags are kept.
+const GHL_TAGS = (process.env.GHL_TAGS || "vulcan lucy off market").split(",").map((t) => t.trim()).filter(Boolean);
 const CONTACTS_URL = process.env.CONTACTS_URL ||
   "https://www.vulcan7dialer.com/cm/index#params/dmlld19pZD05ODEzOCZwYWdlPTE=";
 
@@ -38,13 +43,13 @@ const LIST_LABEL = process.env.LIST_LABEL || "Off Market"; // only used in log l
 const MIN_LIST_PRICE = Number(process.env.MIN_LIST_PRICE || 150000); // leads listed below this are not sent
 const DEBUG_FIELDS = process.env.DEBUG_FIELDS === "1"; // dump labels + phone markup for the first lead
 
-if (!EMAIL || !PASSWORD || !WEBHOOK_URL) {
-  console.error("Missing config. EMAIL, PASSWORD and WEBHOOK_URL must all be set.");
+if (!EMAIL || !PASSWORD || !GHL_TOKEN || !GHL_LOCATION_ID) {
+  console.error("Missing config. EMAIL, PASSWORD, GHL_TOKEN and GHL_LOCATION_ID must all be set.");
   process.exit(1);
 }
 
 // Destination folder. It must already exist in Vulcan7, the script only moves into it.
-const folderName = process.env.FOLDER_NAME || "Expired Moved to GHL";
+const folderName = process.env.FOLDER_NAME || "Moved to GHL";
 
 // "$249,900" -> 249900. Returns null when the text has no readable number.
 function parsePrice(text) {
@@ -52,7 +57,7 @@ function parsePrice(text) {
   return Number.isFinite(n) ? n : null;
 }
 
-// Every field the webhook expects, so a lead whose detail page fails still has all keys
+// Every field the script collects, so a lead whose detail page fails still has all keys
 const DEFAULT_DETAIL = {
   street: "", city: "", state: "", zip: "",
   mls_number: "", property_type: "", mls_status: "", status_change_date: "", list_price: "",
@@ -68,6 +73,217 @@ const DEFAULT_DETAIL = {
   phone_3: "", phone_3_dnc: "",
   phone_4: "", phone_4_dnc: "",
   phone_5: "", phone_5_dnc: ""
+};
+
+// ---------- GoHighLevel ----------
+const GHL_BASE = process.env.GHL_BASE_URL || "https://services.leadconnectorhq.com"; // override only for testing
+const GHL_VERSION = "2021-07-28";
+
+// Script field -> GHL custom field label(s). Matching ignores case, spaces and punctuation,
+// and also tries the field key, so "Phone 2 DNC Status" matches "phone_2_dnc_status".
+// Every label that exists in the sub-account gets the value (the Zap filled Beds AND Bedrooms,
+// Sqft AND Square Footage, and three address fields, so those are all sent here too).
+// Add or rename labels without editing the script by setting GHL_FIELD_MAP, for example
+// {"mls_number":["MLS #"],"zillow_link":["Zillow URL"]}
+const FIELD_LABELS = {
+  street: ["Street Address", "Current Address", "Property Address"],
+  mls_number: ["MLS Number"],
+  property_type: ["Property Type"],
+  mls_status: ["MLS Status"],
+  status_change_date: ["Status Change Date"],
+  list_price: ["Price", "List Price"],
+  beds: ["Beds", "Bedrooms"],
+  baths: ["Baths", "Bathrooms"],
+  square_footage: ["Sqft", "Square Footage"],
+  days_on_market: ["Days on Market"],
+  listing_agent: ["Listing Agent"],
+  listing_office: ["Listing Office"],
+  zillow_link: ["Zillow Link"],
+  google_maps_link: ["Google Maps Link"],
+  facebook: ["Facebook"],
+  instagram: ["Instagram"],
+  linkedin: ["LinkedIn"],
+  twitter: ["Twitter"],
+  tiktok: ["TikTok"],
+  youtube: ["YouTube"],
+  owner_2_first_name: ["Owner 2 First Name"],
+  owner_2_last_name: ["Owner 2 Last Name"],
+  phone_1: ["Phone 1"], phone_1_dnc: ["Phone 1 DNC Status"],
+  phone_2: ["Phone 2"], phone_2_dnc: ["Phone 2 DNC Status"],
+  phone_3: ["Phone 3"], phone_3_dnc: ["Phone 3 DNC Status"],
+  phone_4: ["Phone 4"], phone_4_dnc: ["Phone 4 DNC Status"],
+  phone_5: ["Phone 5"], phone_5_dnc: ["Phone 5 DNC Status"]
+};
+
+// These were filled by the Zap, so they must exist in GHL. If one is missing the run stops
+// before scraping. Set GHL_ALLOW_MISSING_FIELDS=1 to continue without them.
+const REQUIRED_FIELD_KEYS = [
+  "street", "list_price", "beds", "square_footage", "days_on_market", "google_maps_link",
+  "twitter", "tiktok", "owner_2_first_name", "owner_2_last_name",
+  "phone_3", "phone_4", "phone_2_dnc", "phone_4_dnc", "phone_5_dnc"
+];
+
+const normLabel = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+// "+13057838988" for 10 digit US numbers. Anything else is passed through as typed.
+function toPhone(raw) {
+  const t = String(raw || "").trim();
+  if (!t) return "";
+  const digits = t.replace(/\D/g, "");
+  if (t.startsWith("+")) return `+${digits}`;
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  return t;
+}
+
+async function initGhl() {
+  const http = axios.create({
+    baseURL: GHL_BASE,
+    timeout: 30000,
+    headers: {
+      Authorization: `Bearer ${GHL_TOKEN}`,
+      Version: GHL_VERSION,
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    }
+  });
+
+  let res;
+  try {
+    res = await http.get(`/locations/${GHL_LOCATION_ID}/customFields`, { params: { model: "contact" } });
+  } catch (err) {
+    const body = err.response?.data ? ` ${JSON.stringify(err.response.data).slice(0, 300)}` : "";
+    throw new Error(`Could not read custom fields from GoHighLevel (${err.response?.status || err.message}).${body} Check GHL_TOKEN (needs contacts.write and locations/customFields.readonly) and GHL_LOCATION_ID.`);
+  }
+
+  const fields = res.data?.customFields || [];
+  if (!fields.length) {
+    throw new Error("GoHighLevel returned no contact custom fields for this location. Wrong GHL_LOCATION_ID, or the token cannot see custom fields.");
+  }
+
+  const byName = new Map();
+  for (const f of fields) {
+    byName.set(normLabel(f.name), f);
+    if (f.fieldKey) byName.set(normLabel(String(f.fieldKey).replace(/^contact\./, "")), f);
+  }
+
+  let labels = FIELD_LABELS;
+  if (process.env.GHL_FIELD_MAP) {
+    try {
+      labels = { ...FIELD_LABELS, ...JSON.parse(process.env.GHL_FIELD_MAP) };
+    } catch (e) {
+      throw new Error(`GHL_FIELD_MAP is not valid JSON: ${e.message}`);
+    }
+  }
+
+  const map = {};      // script key -> [GHL field objects]
+  const unmatched = [];
+  for (const [key, names] of Object.entries(labels)) {
+    const hits = [];
+    for (const n of [].concat(names)) {
+      const f = byName.get(normLabel(n));
+      if (f && !hits.includes(f)) hits.push(f);
+    }
+    if (hits.length) map[key] = hits; else unmatched.push(key);
+  }
+
+  console.log(`ℹ️ GHL: ${fields.length} contact custom fields found. Script fields mapped:`);
+  for (const [key, hits] of Object.entries(map)) {
+    console.log(`   ${key} -> ${hits.map((f) => `"${f.name}" [${f.dataType}]`).join(", ")}`);
+  }
+  if (unmatched.length) {
+    console.warn(`⚠️ No GHL custom field found for: ${unmatched.join(", ")}. These values are NOT sent.`);
+  }
+
+  const missingRequired = REQUIRED_FIELD_KEYS.filter((k) => !map[k]);
+  if (missingRequired.length && process.env.GHL_ALLOW_MISSING_FIELDS !== "1") {
+    throw new Error(`Required GHL custom fields not found for: ${missingRequired.join(", ")}. Fix the field names, set GHL_FIELD_MAP, or set GHL_ALLOW_MISSING_FIELDS=1 to run without them.`);
+  }
+
+  return { http, map };
+}
+
+// Creates or updates one contact, then adds the tags. Safe to retry: the upsert matches on
+// phone/email, and adding a tag that is already there changes nothing.
+async function sendLeadToGhl(ghl, lead) {
+  const clean = (v) => String(v ?? "").trim();
+
+  const customFields = [];
+  for (const [key, fields] of Object.entries(ghl.map)) {
+    const value = clean(lead[key]);
+    if (!value) continue; // never overwrite existing data with a blank
+
+    for (const f of fields) {
+      let fieldValue = value;
+      if (f.dataType === "MONETORY" || f.dataType === "NUMERICAL") {
+        const n = parsePrice(value);
+        if (n === null) continue;
+        fieldValue = n;
+      }
+      customFields.push({ id: f.id, fieldValue });
+    }
+  }
+
+  const body = {
+    locationId: GHL_LOCATION_ID,
+    firstName: clean(lead.first_name),
+    lastName: clean(lead.last_name),
+    name: clean(lead.full_name),
+    email: clean(lead.email),
+    phone: toPhone(lead.phone),
+    address1: clean(lead.street),
+    city: clean(lead.city),
+    state: clean(lead.state),
+    postalCode: clean(lead.zip),
+    source: GHL_SOURCE,
+    customFields
+  };
+  for (const k of Object.keys(body)) {
+    if (body[k] === "") delete body[k];
+  }
+
+  const up = await ghl.http.post("/contacts/upsert", body);
+  const contactId = up.data?.contact?.id;
+  if (!contactId) {
+    throw new Error(`Upsert returned no contact id (HTTP ${up.status}): ${JSON.stringify(up.data).slice(0, 200)}`);
+  }
+
+  if (GHL_TAGS.length) {
+    await ghl.http.post(`/contacts/${contactId}/tags`, { tags: GHL_TAGS });
+  }
+
+  return { contactId, isNew: up.data?.new === true };
+}
+
+
+// Runs inside the page. Finds the move-menu entry for the target folder and clicks it.
+// The same folder can be listed in more than one menu on the page (Move, Actions), so
+// entries that are actually showing win over hidden ones.
+const selectFolderInPage = (targetFolderName) => {
+  const normalize = (s) => (s || "").replace(/\s+/g, " ").trim();
+  const titleOf = (el) => normalize(el.getAttribute("title") || el.textContent || "");
+  const target = normalize(targetFolderName);
+
+  let items = Array.from(document.querySelectorAll("li.move-contacts-folder[title]"));
+  if (!items.length) {
+    items = Array.from(document.querySelectorAll("#cm_move_dropdown li, .dropdown-menu li"));
+  }
+
+  const matches = items.filter((el) => titleOf(el) === target);
+  if (matches.length === 0) return { status: "missing" };
+
+  // The Move menu was just opened, so its entries are the visible ones
+  const visible = matches.filter((el) => el.getClientRects().length > 0);
+  const item = (visible.length ? visible : matches)[0];
+
+  const link =
+    item.querySelector("a.move-to-folder") ||
+    item.querySelector("a") ||
+    item;
+
+  link.scrollIntoView({ block: "center" });
+  link.click();
+  return { status: "clicked", matches: matches.length, visible: visible.length };
 };
 
 (async () => {
@@ -108,6 +324,10 @@ const DEFAULT_DETAIL = {
   // === end CI hardening ===
 
   try {
+    // Check the GHL token, location and custom fields BEFORE scraping, so a bad setup
+    // fails in seconds instead of after every detail page has been fetched.
+    const ghl = await initGhl();
+
     // ---------- Log in ----------
     await gotoWithRetry(page, LOGIN_URL);
     await page.waitForSelector('input[name="email"], #email, input[name="username"]', { timeout: 120000 });
@@ -395,10 +615,11 @@ const DEFAULT_DETAIL = {
       }
     }
 
-    // ---------- Send to webhook ----------
-    // Retries each lead up to 3 times. A 404/410 means the webhook is dead, so stop
-    // right away. Any lead that still fails stops the run before the move step, so
-    // nothing gets moved out of the list unless it was delivered.
+    // ---------- Send to GoHighLevel ----------
+    // Retries each lead up to 3 times. A 401/403 means the token or location is wrong, so
+    // stop right away. A 400/422 (bad data) is not retried. Any lead that still fails stops
+    // the run before the move step, so nothing gets moved out of the list unless it was
+    // delivered.
     const failedLeads = [];
 
     // Price filter. List price only exists on the detail page, so this runs after the
@@ -423,25 +644,27 @@ const DEFAULT_DETAIL = {
       console.log(`⏭️ Skipped (list price ${lead.list_price}): ${lead.full_name}`);
     }
 
+    let created = 0, updated = 0;
+
     for (const lead of toSend) {
       let ok = false;
 
       for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
         try {
-          const res = await axios.post(
-            WEBHOOK_URL,
-            { timestamp: new Date().toISOString(), lead },
-            { timeout: 30000 }
-          );
-          console.log(`📤 Sent: ${lead.full_name} (${res.status})`);
+          const r = await sendLeadToGhl(ghl, lead);
+          if (r.isNew) created++; else updated++;
+          console.log(`📤 Sent: ${lead.full_name} (${r.isNew ? "created" : "updated"}, ${r.contactId})`);
           ok = true;
         } catch (err) {
           const status = err.response?.status;
-          console.error(`❌ Send failed (${attempt}/3) for ${lead.full_name}: ${err.message}`);
+          const body = err.response?.data ? ` ${JSON.stringify(err.response.data).slice(0, 300)}` : "";
+          console.error(`❌ Send failed (${attempt}/3) for ${lead.full_name}: ${err.message}${body}`);
 
-          if (status === 404 || status === 410) {
-            throw new Error(`Webhook returned ${status}. Stopping before the move step.`);
+          if (status === 401 || status === 403) {
+            throw new Error(`GoHighLevel returned ${status}. Check GHL_TOKEN scopes and GHL_LOCATION_ID. Stopping before the move step.`);
           }
+          // Other 4xx means the data was rejected, retrying the same data will not help
+          if (status && status >= 400 && status < 500 && status !== 429) break;
           await sleep(1000 * attempt);
         }
       }
@@ -449,6 +672,8 @@ const DEFAULT_DETAIL = {
       if (!ok) failedLeads.push(lead);
       await sleep(500); // gentle pacing
     }
+
+    console.log(`ℹ️ GHL: ${created} created, ${updated} updated, ${failedLeads.length} failed.`);
 
     if (failedLeads.length > 0) {
       throw new Error(`${failedLeads.length} lead(s) failed to send. Skipping the move step.`);
@@ -523,32 +748,9 @@ const DEFAULT_DETAIL = {
     }, { timeout: 10000 });
 
     // Click exact folder entry
-    const clickedFolder = await page.evaluate((targetFolderName) => {
-      const normalize = (s) => (s || "").replace(/\s+/g, " ").trim();
+    const picked = await page.evaluate(selectFolderInPage, folderName);
 
-      let items = Array.from(document.querySelectorAll("li.move-contacts-folder[title]"));
-      if (!items.length) {
-        items = Array.from(document.querySelectorAll("#cm_move_dropdown li, .dropdown-menu li"));
-      }
-
-      for (const item of items) {
-        const title = normalize(item.getAttribute("title") || item.textContent || "");
-        if (title === normalize(targetFolderName)) {
-          const link =
-            item.querySelector("a.move-to-folder") ||
-            item.querySelector("a") ||
-            item;
-
-          link.scrollIntoView({ block: "center" });
-          link.click();
-          return true;
-        }
-      }
-
-      return false;
-    }, folderName);
-
-    if (!clickedFolder) {
+    if (picked.status === "missing") {
       const available = await page.evaluate(() =>
         Array.from(document.querySelectorAll("li.move-contacts-folder[title]")).map((li) => li.getAttribute("title"))
       );
@@ -556,7 +758,13 @@ const DEFAULT_DETAIL = {
       throw new Error(`Could not find move folder "${folderName}". Create it in Vulcan7 first, then re-run.`);
     }
 
-    console.log(`✅ Clicked folder "${folderName}" in move menu.`);
+    console.log(
+      `✅ Clicked folder "${folderName}" in move menu ` +
+      `(${picked.matches} matching entr${picked.matches === 1 ? "y" : "ies"}, ${picked.visible} visible).`
+    );
+    if (picked.visible > 1) {
+      console.warn("⚠️ More than one visible entry has this name and the first was clicked. If contacts land in the wrong folder, give the folders unique names.");
+    }
     await sleep(1500);
 
     // Confirm modal if it appears
