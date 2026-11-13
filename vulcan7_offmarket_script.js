@@ -79,22 +79,23 @@ const DEFAULT_DETAIL = {
 const GHL_BASE = process.env.GHL_BASE_URL || "https://services.leadconnectorhq.com"; // override only for testing
 const GHL_VERSION = "2021-07-28";
 
-// Script field -> GHL custom field label(s). Matching ignores case, spaces and punctuation,
-// and also tries the field key, so "Phone 2 DNC Status" matches "phone_2_dnc_status".
-// Every label that exists in the sub-account gets the value (the Zap filled Beds AND Bedrooms,
-// Sqft AND Square Footage, and three address fields, so those are all sent here too).
-// Add or rename labels without editing the script by setting GHL_FIELD_MAP, for example
-// {"mls_number":["MLS #"],"zillow_link":["Zillow URL"]}
+// Script field -> GHL custom field name(s). Matching ignores case, spaces and punctuation,
+// and also tries the field key. Every field that matches gets the value, and if two fields
+// share a name (one per folder, say) both get it. The names below are the ones in Lucy's
+// account (Vulcan Info, All Phone Numbers and Contact folders) plus the extra names the Zap
+// used (Beds, Sqft, Price, Current Address, Property Address, Twitter, TikTok).
+// Add or rename names without editing the script by setting GHL_FIELD_MAP, for example
+// {"zillow_link":["Zillow URL"],"twitter":["X Profile"]}
 const FIELD_LABELS = {
   street: ["Street Address", "Current Address", "Property Address"],
   mls_number: ["MLS Number"],
   property_type: ["Property Type"],
   mls_status: ["MLS Status"],
   status_change_date: ["Status Change Date"],
-  list_price: ["Price", "List Price"],
-  beds: ["Beds", "Bedrooms"],
-  baths: ["Baths", "Bathrooms"],
-  square_footage: ["Sqft", "Square Footage"],
+  list_price: ["List Price", "Price"],
+  beds: ["Bedrooms", "Beds"],
+  baths: ["Bathrooms", "Baths"],
+  square_footage: ["Square Footage", "Sqft"],
   days_on_market: ["Days on Market"],
   listing_agent: ["Listing Agent"],
   listing_office: ["Listing Office"],
@@ -108,18 +109,21 @@ const FIELD_LABELS = {
   youtube: ["YouTube"],
   owner_2_first_name: ["Owner 2 First Name"],
   owner_2_last_name: ["Owner 2 Last Name"],
-  phone_1: ["Phone 1"], phone_1_dnc: ["Phone 1 DNC Status"],
+  date_added: ["Date Added (Vulcan)"],
+  // Phone 1 is the contact's main phone (standard Phone field, set separately). Its DNC flag
+  // goes to "Phone DNC Status".
+  phone_1_dnc: ["Phone DNC Status", "Phone 1 DNC Status"],
   phone_2: ["Phone 2"], phone_2_dnc: ["Phone 2 DNC Status"],
   phone_3: ["Phone 3"], phone_3_dnc: ["Phone 3 DNC Status"],
   phone_4: ["Phone 4"], phone_4_dnc: ["Phone 4 DNC Status"],
   phone_5: ["Phone 5"], phone_5_dnc: ["Phone 5 DNC Status"]
 };
 
-// These were filled by the Zap, so they must exist in GHL. If one is missing the run stops
-// before scraping. Set GHL_ALLOW_MISSING_FIELDS=1 to continue without them.
+// These exist in Lucy's account, so the run stops before scraping if one cannot be found.
+// Set GHL_ALLOW_MISSING_FIELDS=1 to continue without them.
 const REQUIRED_FIELD_KEYS = [
   "street", "list_price", "beds", "square_footage", "days_on_market", "google_maps_link",
-  "twitter", "tiktok", "owner_2_first_name", "owner_2_last_name",
+  "owner_2_first_name", "owner_2_last_name",
   "phone_3", "phone_4", "phone_2_dnc", "phone_4_dnc", "phone_5_dnc"
 ];
 
@@ -153,7 +157,7 @@ async function initGhl() {
     res = await http.get(`/locations/${GHL_LOCATION_ID}/customFields`, { params: { model: "contact" } });
   } catch (err) {
     const body = err.response?.data ? ` ${JSON.stringify(err.response.data).slice(0, 300)}` : "";
-    throw new Error(`Could not read custom fields from GoHighLevel (${err.response?.status || err.message}).${body} Check GHL_TOKEN (needs contacts.write and locations/customFields.readonly) and GHL_LOCATION_ID.`);
+    throw new Error(`Could not read custom fields from GoHighLevel (${err.response?.status || err.message}).${body} The token needs the scopes contacts.write and locations/customFields.readonly, and GHL_LOCATION_ID must belong to the same sub-account as the token.`);
   }
 
   const fields = res.data?.customFields || [];
@@ -161,10 +165,16 @@ async function initGhl() {
     throw new Error("GoHighLevel returned no contact custom fields for this location. Wrong GHL_LOCATION_ID, or the token cannot see custom fields.");
   }
 
-  const byName = new Map();
+  // name or key -> every field that has it
+  const index = new Map();
+  const addIndex = (k, f) => {
+    if (!k) return;
+    if (!index.has(k)) index.set(k, []);
+    if (!index.get(k).includes(f)) index.get(k).push(f);
+  };
   for (const f of fields) {
-    byName.set(normLabel(f.name), f);
-    if (f.fieldKey) byName.set(normLabel(String(f.fieldKey).replace(/^contact\./, "")), f);
+    addIndex(normLabel(f.name), f);
+    if (f.fieldKey) addIndex(normLabel(String(f.fieldKey).replace(/^contact\./, "")), f);
   }
 
   let labels = FIELD_LABELS;
@@ -181,15 +191,16 @@ async function initGhl() {
   for (const [key, names] of Object.entries(labels)) {
     const hits = [];
     for (const n of [].concat(names)) {
-      const f = byName.get(normLabel(n));
-      if (f && !hits.includes(f)) hits.push(f);
+      for (const f of index.get(normLabel(n)) || []) {
+        if (!hits.includes(f)) hits.push(f);
+      }
     }
     if (hits.length) map[key] = hits; else unmatched.push(key);
   }
 
   console.log(`ℹ️ GHL: ${fields.length} contact custom fields found. Script fields mapped:`);
   for (const [key, hits] of Object.entries(map)) {
-    console.log(`   ${key} -> ${hits.map((f) => `"${f.name}" [${f.dataType}]`).join(", ")}`);
+    console.log(`   ${key} -> ${hits.map((f) => `"${f.name}" {${f.fieldKey}} [${f.dataType}]`).join(", ")}`);
   }
   if (unmatched.length) {
     console.warn(`⚠️ No GHL custom field found for: ${unmatched.join(", ")}. These values are NOT sent.`);
@@ -200,7 +211,7 @@ async function initGhl() {
     throw new Error(`Required GHL custom fields not found for: ${missingRequired.join(", ")}. Fix the field names, set GHL_FIELD_MAP, or set GHL_ALLOW_MISSING_FIELDS=1 to run without them.`);
   }
 
-  return { http, map };
+  return { http, map, verified: false };
 }
 
 // Creates or updates one contact, then adds the tags. Safe to retry: the upsert matches on
@@ -220,7 +231,8 @@ async function sendLeadToGhl(ghl, lead) {
         if (n === null) continue;
         fieldValue = n;
       }
-      customFields.push({ id: f.id, fieldValue });
+      // Both spellings are accepted by the API (field_value is the older one)
+      customFields.push({ id: f.id, fieldValue, field_value: fieldValue });
     }
   }
 
@@ -252,9 +264,24 @@ async function sendLeadToGhl(ghl, lead) {
     await ghl.http.post(`/contacts/${contactId}/tags`, { tags: GHL_TAGS });
   }
 
+  // Check the first lead by reading the contact back, so custom fields that are silently
+  // dropped show up in the log on the very first lead instead of after the whole run.
+  if (!ghl.verified) {
+    ghl.verified = true;
+    try {
+      const back = await ghl.http.get(`/contacts/${contactId}`);
+      const stored = (back.data?.contact?.customFields || []).filter((c) => c.value !== "" && c.value != null);
+      console.log(`🔎 Check on first lead (${lead.full_name}): sent ${customFields.length} custom field values, GHL shows ${stored.length} filled.`);
+      if (customFields.length && !stored.length) {
+        console.warn("⚠️ GHL stored NO custom field values for the first lead. Check the field mapping above and the token scopes.");
+      }
+    } catch (e) {
+      console.log(`ℹ️ Could not read the first contact back (${e.response?.status || e.message}). Open it in GHL to check the custom fields. (Reading needs the contacts.readonly scope.)`);
+    }
+  }
+
   return { contactId, isNew: up.data?.new === true };
 }
-
 
 // Runs inside the page. Finds the move-menu entry for the target folder and clicks it.
 // The same folder can be listed in more than one menu on the page (Move, Actions), so
@@ -375,6 +402,7 @@ const selectFolderInPage = (targetFolderName) => {
         const emailEl = document.querySelector(`div[id='cell-example-${id}-${emailCell}'] a[href^='mailto:']`);
         const email = emailEl?.getAttribute("href")?.replace("mailto:", "").trim() || "";
 
+        const dateMatch = (row.innerText || "").match(/([A-Z][a-z]{2} \d{1,2}, \d{4} \d{1,2}:\d{2}\s?[ap]m)/i);
         const nameParts = fullName.split(" ");
         out.push({
           full_name: fullName,
@@ -382,7 +410,8 @@ const selectFolderInPage = (targetFolderName) => {
           last_name: nameParts.slice(1).join(" "),
           phone,
           email,
-          contact_id: id
+          contact_id: id,
+          date_added: dateMatch ? dateMatch[1] : ""
         });
       }
 
@@ -390,6 +419,7 @@ const selectFolderInPage = (targetFolderName) => {
     }, { phoneCell: PHONE_CELL_ID, emailCell: EMAIL_CELL_ID });
 
     console.log(`✅ Found ${leads.length} raw leads in "${LIST_LABEL}"`);
+    console.log(`ℹ️ Date Added read for ${leads.filter((l) => l.date_added).length} of ${leads.length} leads${leads[0] ? ` (first: "${leads[0].date_added}")` : ""}.`);
 
     // ---------- De-duplicate ----------
     const seen = new Set();
@@ -415,10 +445,18 @@ const selectFolderInPage = (targetFolderName) => {
         const detailUrl = `https://www.vulcan7dialer.com/cm/index#contact/${lead.contact_id}`;
         await gotoWithRetry(detailPage, detailUrl);
 
-        await detailPage.waitForFunction(() => {
-          const ths = Array.from(document.querySelectorAll("th"));
-          return ths.some((th) => th.textContent.includes("MLS Number"));
-        }, { timeout: 15000 });
+        try {
+          await detailPage.waitForFunction(() => {
+            const ths = Array.from(document.querySelectorAll("th"));
+            return ths.some((th) => th.textContent.includes("MLS Number"));
+          }, { timeout: 15000 });
+        } catch (waitErr) {
+          console.warn(`⚠️ No MLS data on the detail page for ${lead.full_name}, reading the phones and address only.`);
+          await detailPage.waitForFunction(
+            () => document.querySelector('tbody[data-section="phones"] a[data-type="phone"], a[data-type="address"]'),
+            { timeout: 10000 }
+          );
+        }
 
         // Optional: dump labels + phone markup once so selectors can be confirmed
         if (DEBUG_FIELDS && !debugPrinted) {
