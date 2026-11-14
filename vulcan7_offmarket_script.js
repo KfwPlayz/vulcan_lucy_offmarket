@@ -49,7 +49,7 @@ if (!EMAIL || !PASSWORD || !GHL_TOKEN || !GHL_LOCATION_ID) {
 }
 
 // Destination folder. It must already exist in Vulcan7, the script only moves into it.
-const folderName = process.env.FOLDER_NAME || "Moved to GHL";
+const folderName = process.env.FOLDER_NAME || "Expired Moved to GHL";
 
 // "$249,900" -> 249900. Returns null when the text has no readable number.
 function parsePrice(text) {
