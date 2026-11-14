@@ -1,10 +1,7 @@
-name: Daily Vulcan7 Off Market Job
+name: Daily Vulcan7 Off Market Job Lucy
 
 on:
-  schedule:
-    - cron: "7 8 * * 1-6"   # 8:07 AM Eastern, DST handled by the timezone field
-      timezone: "America/New_York"
-  workflow_dispatch:
+  workflow_dispatch:   # triggered by cron-job.org, no GitHub schedule
 
 permissions:
   contents: read
@@ -22,11 +19,11 @@ jobs:
       # Secrets (one set per repo)
       EMAIL: ${{ secrets.EMAIL }}
       PASSWORD: ${{ secrets.PASSWORD }}
-      GHL_TOKEN: ${{ secrets.GHL_TOKEN }}     # Private Integration token for Lucy's sub-account
+      GHL_TOKEN: ${{ secrets.GHL_TOKEN }}   # Private Integration token created INSIDE Lucy's own GHL account
 
       # ---- GoHighLevel ----
       GHL_LOCATION_ID: "TZfTgN59dTmTOolfOQNP"
-      GHL_TAGS: "vulcan lucy off market"                 # comma separated, added to the contact (existing tags are kept)
+      GHL_TAGS: "vulcan lucy off market"        # comma separated, added to the contact (existing tags are kept)
       GHL_SOURCE: "vulcan"
 
       # ---- Vulcan7 ----
