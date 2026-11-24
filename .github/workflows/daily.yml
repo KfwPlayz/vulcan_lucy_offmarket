@@ -1,4 +1,4 @@
-name: Daily Vulcan7 Off Market Job Lucy
+name: Daily Vulcan7 Off Market Job (Lucy)
 
 on:
   workflow_dispatch:   # triggered by cron-job.org, no GitHub schedule
@@ -35,6 +35,8 @@ jobs:
       PHONE_CELL_ID: "143332"               # account specific column ids
       EMAIL_CELL_ID: "143333"
       # DEBUG_FIELDS: "1"                   # uncomment once to log detail-page labels for the first lead
+
+      TERMS_SIGNATURE_NAME: "Lucia Celada"   # signs the Vulcan7 Terms of Service page if it appears
 
       PUPPETEER_SKIP_DOWNLOAD: "true"
 
