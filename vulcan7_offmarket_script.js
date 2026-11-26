@@ -93,7 +93,7 @@ const MOVE_CONTACTS = (process.env.MOVE_CONTACTS || "true").toLowerCase() === "t
 const PHONE_CELL_ID = process.env.PHONE_CELL_ID || "143332"; // account specific column ids
 const EMAIL_CELL_ID = process.env.EMAIL_CELL_ID || "143333";
 const LIST_LABEL = process.env.LIST_LABEL || "Off Market"; // only used in log lines
-const MIN_LIST_PRICE = Number(process.env.MIN_LIST_PRICE || 150000); // leads listed below this are not sent
+const MIN_LIST_PRICE = Number(process.env.MIN_LIST_PRICE || 250000); // leads listed below this are not sent
 const DEBUG_FIELDS = process.env.DEBUG_FIELDS === "1"; // dump labels + phone markup for the first lead
 
 if (!EMAIL || !PASSWORD || !GHL_TOKEN || !GHL_LOCATION_ID) {
